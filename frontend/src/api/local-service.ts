@@ -5,6 +5,13 @@ import type { ActionResult, EntryRow, ModuleMeta, OverviewResult, PageResult } f
 // 会写进数据的「往回走」动作：命中就把这条记录标成异常态，看板上能一眼看出来。
 const NEGATIVE_ACTIONS = ['撤销', '作废', '拒绝', '驳回', '停用', '忽略', '下线', '回滚']
 
+// 无人机任务只许顺航迹推进：待执行→飞行中→已完成/因故中止，越级关闭直接拒绝。
+const DRONE_ACTION_FROM: Record<string, string[]> = {
+  开始飞行: ['待执行'],
+  确认完成: ['飞行中'],
+  中止任务: ['飞行中'],
+}
+
 export function moduleMeta(key: string): ModuleMeta {
   const meta = MODULE_BY_KEY.get(key)
   if (!meta) {
@@ -23,8 +30,34 @@ export function filterRows(rows: EntryRow[], filters: Record<string, string>): E
   )
 }
 
+// 旧任务兼容：历史无人机任务没有飞行区域字段，按所属队伍对应的林区补全（仅展示，不改原始记录）。
+export function compatibleArea(row: EntryRow): string {
+  const raw = row['飞行区域']
+  if (raw !== undefined && raw !== null && String(raw).trim() !== '') {
+    return String(raw)
+  }
+  const team = String(row['所属队伍'] ?? '').trim()
+  if (!team) {
+    return '未维护林区（按所属队伍兼容）'
+  }
+  const mapped = listRows('fireteam').find(
+    (item) => String(item['队伍名称'] ?? '').trim() === team,
+  )
+  const forest = mapped ? String(mapped['所属林场'] ?? '').trim() : ''
+  return forest ? `${forest}（按所属队伍兼容）` : '未维护林区（按所属队伍兼容）'
+}
+
 export function listEntries(key: string, filters: Record<string, string> = {}): PageResult {
-  const matched = filterRows(listRows(key), filters)
+  let rows = listRows(key)
+  if (key === 'drone') {
+    // 旧任务缺飞行区域时按所属队伍补全后再参与筛选，原始发现数等字段一律不动。
+    rows = rows.map((row) =>
+      row['飞行区域'] === undefined || String(row['飞行区域']).trim() === ''
+        ? { ...row, 飞行区域: compatibleArea(row) }
+        : row,
+    )
+  }
+  const matched = filterRows(rows, filters)
   return { items: matched, total: matched.length, page: 1, size: matched.length }
 }
 
@@ -43,11 +76,21 @@ export function runAction(key: string, id: number, action: string): ActionResult
   if (current === target) {
     return { ok: false, message: `${meta.entity}已经是「${target}」，不用重复操作` }
   }
-  const lastStatus = meta.statuses[meta.statuses.length - 1]
+  if (key === 'drone') {
+    const allowedFrom = DRONE_ACTION_FROM[action]
+    if (allowedFrom && !allowedFrom.includes(current)) {
+      // 越权关闭：没在飞行中的任务不能直接确认完成或中止。
+      const expect = allowedFrom.join('、')
+      return { ok: false, message: `当前状态为「${current}」，只有「${expect}」的任务才能${action}` }
+    }
+  }
+  const terminal = key === 'drone'
+    ? target === '已完成' || target === '因故中止'
+    : target === meta.statuses[meta.statuses.length - 1]
   const updated: EntryRow = {
     ...rows[index],
     status: target,
-    pending: target !== lastStatus,
+    pending: !terminal,
     abnormal: NEGATIVE_ACTIONS.some((verb) => action.startsWith(verb)),
   }
   const next = [...rows]
@@ -65,7 +108,7 @@ export function exportEntries(key: string): { filename: string; content: string 
   const meta = moduleMeta(key)
   const header = ['编号', ...meta.fields, '当前状态']
   const lines = [header.join(',')]
-  for (const row of listRows(key)) {
+  for (const row of listEntries(key).items) {
     lines.push([row.id, ...meta.fields.map((field) => row[field] ?? ''), row.status].join(','))
   }
   return { filename: `${meta.name}-清单.csv`, content: `\uFEFF${lines.join('\n')}` }
