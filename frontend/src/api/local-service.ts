@@ -1,9 +1,27 @@
 import { MODULE_BY_KEY } from '@/data/modules'
 import { allRows, listRows, resetRows, saveRows } from '@/data/local-store'
-import type { ActionResult, EntryRow, ModuleMeta, OverviewResult, PageResult } from '@/data/types'
+import type {
+  ActionResult,
+  EntryRow,
+  ModuleHooks,
+  ModuleMeta,
+  OverviewResult,
+  PageResult,
+} from '@/data/types'
 
 // 会写进数据的「往回走」动作：命中就把这条记录标成异常态，看板上能一眼看出来。
 const NEGATIVE_ACTIONS = ['撤销', '作废', '拒绝', '驳回', '停用', '忽略', '下线', '回滚']
+
+// 模块钩子注册表：各模块的兼容、专属动作与跨模块联动都挂在这里，通用引擎不动。
+const MODULE_HOOKS = new Map<string, ModuleHooks>()
+
+export function registerModuleHooks(key: string, hooks: ModuleHooks): void {
+  MODULE_HOOKS.set(key, hooks)
+}
+
+function hooksFor(key: string): ModuleHooks | undefined {
+  return MODULE_HOOKS.get(key)
+}
 
 export function moduleMeta(key: string): ModuleMeta {
   const meta = MODULE_BY_KEY.get(key)
@@ -23,23 +41,41 @@ export function filterRows(rows: EntryRow[], filters: Record<string, string>): E
   )
 }
 
+function normalizeRows(key: string, rows: EntryRow[]): EntryRow[] {
+  const normalize = hooksFor(key)?.normalizeRow
+  return normalize ? rows.map(normalize) : rows
+}
+
 export function listEntries(key: string, filters: Record<string, string> = {}): PageResult {
-  const matched = filterRows(listRows(key), filters)
+  // 先兼容旧数据再筛选：按兜底后的字段（如旧任务的飞行区域）也能检索到。
+  const matched = filterRows(normalizeRows(key, listRows(key)), filters)
   return { items: matched, total: matched.length, page: 1, size: matched.length }
 }
 
 export function runAction(key: string, id: number, action: string): ActionResult {
   const meta = moduleMeta(key)
-  const target = meta.actionTargets[action]
-  if (!target) {
-    return { ok: false, message: `${meta.entity}没有登记「${action}」这个动作` }
-  }
   const rows = listRows(key)
   const index = rows.findIndex((row) => Number(row.id) === id)
   if (index < 0) {
     return { ok: false, message: `没有找到编号为 ${id} 的${meta.entity}` }
   }
+  const target = meta.actionTargets[action]
+  if (!target) {
+    // 不改状态的专属动作（如无人机上传异常架次）分发给模块钩子。
+    const custom = hooksFor(key)?.customActions?.[action]
+    if (custom) {
+      return custom(rows[index])
+    }
+    return { ok: false, message: `${meta.entity}没有登记「${action}」这个动作` }
+  }
   const current = String(rows[index].status)
+  const allowedFrom = meta.transitions?.[action]
+  if (allowedFrom && !allowedFrom.includes(current)) {
+    return {
+      ok: false,
+      message: `越权操作被拒绝：${meta.entity}当前为「${current}」，「${action}」只允许从「${allowedFrom.join('」「')}」发起`,
+    }
+  }
   if (current === target) {
     return { ok: false, message: `${meta.entity}已经是「${target}」，不用重复操作` }
   }
@@ -53,6 +89,8 @@ export function runAction(key: string, id: number, action: string): ActionResult
   const next = [...rows]
   next[index] = updated
   saveRows(key, next)
+  // 流转成功后联动：比如火情报告的核查结论回填无人机核查队列。
+  hooksFor(key)?.afterAction?.(updated, action)
   return { ok: true, message: `${meta.entity}已${action}，当前状态「${target}」` }
 }
 
@@ -65,7 +103,7 @@ export function exportEntries(key: string): { filename: string; content: string 
   const meta = moduleMeta(key)
   const header = ['编号', ...meta.fields, '当前状态']
   const lines = [header.join(',')]
-  for (const row of listRows(key)) {
+  for (const row of normalizeRows(key, listRows(key))) {
     lines.push([row.id, ...meta.fields.map((field) => row[field] ?? ''), row.status].join(','))
   }
   return { filename: `${meta.name}-清单.csv`, content: `\uFEFF${lines.join('\n')}` }
